@@ -1,0 +1,7 @@
+__pycache__/
+.env
+*.log
+downloads/
+extracted/
+auth_state.json
+downloaded.json
