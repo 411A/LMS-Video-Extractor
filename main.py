@@ -374,8 +374,12 @@ async def download_and_extract(context: BrowserContext, href: str, filename: str
     for attempt in range(max_retries):
         dl_page = await context.new_page()
         try:
+            await dl_page.goto(href, timeout=TIMEOUT_PAGE_LOAD)
+            page_text = await dl_page.inner_text('body')
+            if "فایل آفلاین این جلسه در حال آماده سازی است" in page_text:
+                logger.warning(f"The offline file for {filename} is being prepared. Please run the script again in a few hours.")
+                return
             async with dl_page.expect_download(timeout=DOWNLOAD_TIMEOUT) as download_info:
-                await dl_page.goto(href, timeout=TIMEOUT_PAGE_LOAD)
                 await dl_page.click("a:has-text('MP4')")
             download = await download_info.value
             await download.save_as(rar_path)
