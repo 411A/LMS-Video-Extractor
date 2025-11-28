@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     DOWNLOADS_DIR: str = "downloads"
     TIMEOUT_PAGE_LOAD: int = 180000
     DOWNLOAD_TIMEOUT: int = 3600000
+    MAX_CONCURRENT_COURSE_FETCH: int = 6
+    MAX_CONCURRENT_DOWNLOADS: int = 4
     LOG_LEVEL: str = "INFO"
 
     class Config:
@@ -112,8 +114,10 @@ async def login(page: Page, username: str, password: str) -> None:
     logger.info("Login successful.")
 
 
-async def get_course_ids(page: Page) -> list[tuple[str, str, str]]:
-    """Get list of (course_id, course_name, onlineclass_id) from the courses page."""
+async def get_course_ids(context: BrowserContext, page: Page, max_workers: int = 6) -> list[tuple[str, str, str]]:
+    """Get list of (course_id, course_name, onlineclass_id) from the courses page.
+    Fetch onlineclass ids concurrently for faster execution using multiple pages from the same `context`.
+    """
     courses_url = f"{BASE_URL}/my/courses.php"
     logger.info(f"Navigating to courses page: {courses_url}")
     await page.goto(courses_url, timeout=TIMEOUT_PAGE_LOAD)
@@ -169,30 +173,45 @@ async def get_course_ids(page: Page) -> list[tuple[str, str, str]]:
         except Exception as e:
             logger.error(f"[{idx}] Error extracting course info: {e}")
     
-    # Now, for each course, navigate to get onlineclass_id
+    # Now use concurrency to navigate per-course pages and extract the onlineclass module id.
     courses = list()
-    for idx, (course_id, course_name) in enumerate(course_list, 1):
-        try:
-            course_page_url = f"{BASE_URL}/course/view.php?id={course_id}"
-            logger.info(f"[{idx}] Navigating to course page: {course_page_url}")
-            await page.goto(course_page_url, timeout=TIMEOUT_PAGE_LOAD)
-            await page.wait_for_load_state('networkidle', timeout=TIMEOUT_PAGE_LOAD)
-            onlineclass_link = await page.query_selector('a[href*="/mod/onlineclass/view.php?id="]')
-            onlineclass_id = None
-            if onlineclass_link:
-                href = await onlineclass_link.get_attribute('href')
-                logger.info(f"[{idx}] Found onlineclass link: {href}")
-                if href:
-                    m = re.search(r'/mod/onlineclass/view\.php\?id=(\d+)', href)
-                    if m:
-                        onlineclass_id = m.group(1)
-                        logger.info(f"[{idx}] Extracted onlineclass_id: {onlineclass_id}")
-            if onlineclass_id:
-                courses.append((course_id, course_name, onlineclass_id))
-            else:
-                logger.warning(f"[{idx}] No onlineclass module found for course {course_id} ({course_name})")
-        except Exception as e:
-            logger.error(f"[{idx}] Error extracting onlineclass_id for course {course_id}: {e}")
+    sem = asyncio.Semaphore(max_workers)
+
+    async def get_onlineclass_for_course(idx: int, course_id: str, course_name: str) -> Optional[tuple[str, str, str]]:
+        async with sem:
+            try:
+                course_page_url = f"{BASE_URL}/course/view.php?id={course_id}"
+                logger.info(f"[{idx}] Navigating to course page: {course_page_url}")
+                page2 = await context.new_page()
+                try:
+                    await page2.goto(course_page_url, timeout=TIMEOUT_PAGE_LOAD)
+                    # Wait for either the module list or a fallback element that indicates the page is loaded
+                    await page2.wait_for_selector('li[id^="module-"]', timeout=10000)
+                    # Find the onlineclass module anchor; prefer full absolute link and search for query param id
+                    onlineclass_link = await page2.query_selector('a[href*="/mod/onlineclass/view.php?id="]')
+                    onlineclass_id = None
+                    if onlineclass_link:
+                        href = await onlineclass_link.get_attribute('href')
+                        logger.info(f"[{idx}] Found onlineclass link: {href}")
+                        if href:
+                            m = re.search(r'/mod/onlineclass/view\.php\?id=(\d+)', href)
+                            if m:
+                                onlineclass_id = m.group(1)
+                                logger.info(f"[{idx}] Extracted onlineclass_id: {onlineclass_id}")
+                    if onlineclass_id:
+                        return (course_id, course_name, onlineclass_id)
+                    logger.warning(f"[{idx}] No onlineclass module found for course {course_id} ({course_name})")
+                finally:
+                    await page2.close()
+            except Exception as e:
+                logger.error(f"[{idx}] Error extracting onlineclass_id for course {course_id}: {e}")
+            return None
+
+    tasks = [get_onlineclass_for_course(idx, cid, cname) for idx, (cid, cname) in enumerate(course_list, 1)]
+    results = await asyncio.gather(*tasks)
+    for res in results:
+        if res:
+            courses.append(res)
     
     logger.info(f"Found {len(courses)} courses with onlineclass modules.")
     return courses
@@ -214,36 +233,107 @@ async def process_course(context: BrowserContext, course_id: str, downloads_dir:
     
     page = await context.new_page()
     try:
-        # Use the correct onlineclass_id for recordings
+        # Use the correct onlineclass_id for recordings. Navigate to the recording list directly to reduce steps.
         recording_url = f"{BASE_URL}/mod/onlineclass/view.php?id={onlineclass_id}&action=recording.list"
         logger.info(f"Navigating to recording list: {recording_url}")
         await page.goto(recording_url, timeout=TIMEOUT_PAGE_LOAD)
-        await page.wait_for_load_state('networkidle', timeout=TIMEOUT_PAGE_LOAD)
+        # Wait for the list container's existence rather than networkidle
+        try:
+            await page.wait_for_selector('a[href*="action=recording.view"], a[href*="offline.sbu.ac.ir"]', timeout=15000)
+        except Exception:
+            # fallback to generic waiting
+            await page.wait_for_load_state('load', timeout=TIMEOUT_PAGE_LOAD)
 
-        # Locate list
-        logger.info("Locating recording list...")
-        await page.wait_for_selector("ul:has(li:nth-child(3))", timeout=10000)
-        uls = await page.query_selector_all("ul:has(li:nth-child(3))")
-        if len(uls) < 2:
+        # Locate all offline links directly. Search for anchors that point to offline.sbu.ac.ir as a reliable identifier.
+        logger.info("Locating recording items with offline links...")
+        offline_anchors = await page.query_selector_all("a[href^=\"https://offline.sbu.ac.ir\"]")
+        if not offline_anchors:
+            # fallback: find anchors whose href contain 'action=recording.view' or text 'لینک آفلاین'
+            offline_anchors = await page.query_selector_all("a[href*='action=recording.view'], a:has-text('لینک آفلاین')")
+        if not offline_anchors:
             logger.warning(f"Recording list not found for course {course_id}.")
             return
-        lis = await uls[1].query_selector_all('li')
-        # Filter only lis that contain an offline link
-        valid_lis = list()
-        for li in lis:
-            li_html = await li.inner_html()
-            if 'آفلاین' in li_html:
-                valid_lis.append(li)
-        logger.info(f"Found {len(valid_lis)} valid offline recordings to process for course {course_id}.")
+        # Each anchor is contained in an li; gather li parent nodes
+        lis = list()
+        for a in offline_anchors:
+            # Find the parent li for each offline anchor
+            li_handle = await a.evaluate_handle('el => el.closest("li")')
+            li_elem = li_handle.as_element() if li_handle else None
+            if li_elem:
+                lis.append(li_elem)
+        logger.info(f"Found {len(lis)} offline recordings to process for course {course_id}.")
 
-        if not valid_lis:
+        if not lis:
             logger.warning(f"No offline recordings found for course {course_id}. Skipping.")
             return
 
+        # throttle downloads per course
+        max_downloads = getattr(Settings(), 'MAX_CONCURRENT_DOWNLOADS', 4)
+        download_sem = asyncio.Semaphore(max_downloads)
+
         # Process each valid recording
         tasks = list()
-        for idx, li in enumerate(valid_lis, start=1):
-            li_html = await li.inner_html()
+        page_click_lock = asyncio.Lock()
+        for idx, li_handle in enumerate(lis, start=1):
+            li_html = await li_handle.inner_html()
+            res_outer = await parse_li(li_html, idx)
+            expected_filename = res_outer[1] if res_outer else None
+            logger.info(f"Processing item #{idx}, expected filename: {expected_filename}")
+            # Prefer clicking the offline link inside the li if present
+            offline_anchor = await li_handle.query_selector("a[href^='https://offline.sbu.ac.ir'], a:has-text('لینک آفلاین')")
+            if offline_anchor:
+                # click and wait for popup
+                # Build a task to handle the popup click + download so we can process many concurrently
+                async def popup_download_task(li=li_handle, index=idx, _offline_anchor=offline_anchor):
+                    rar_filename = None
+                    mp4_filename_local = None
+                    try:
+                        # compute candidate filename from li content
+                        res = await parse_li(await li.inner_html(), index)
+                        if res:
+                            href, filename = res
+                            rar_filename = filename
+                            mp4_filename_local = filename.replace('.rar', '.mp4')
+                            if mp4_filename_local in downloaded[folder_name]["mp4s"]:
+                                logger.info(f"Already extracted: {mp4_filename_local}")
+                                return
+                        async with download_sem:
+                            async with page_click_lock:
+                                async with page.expect_popup(timeout=15000) as popup_info:
+                                    logger.info(f"Clicking offline link to open popup for index {index} (filename: {rar_filename})")
+                                    await _offline_anchor.click()
+                            popup = await popup_info.value
+                            try:
+                                if not rar_filename:
+                                    rar_filename = f"{index:02d}.rar"
+                                rar_path_local = downloads_dir / folder_name / rar_filename
+                                logger.info(f"Starting popup download for {rar_filename} -> {rar_path_local}")
+                                await trigger_download_on_page(popup, rar_path_local, DOWNLOAD_TIMEOUT)
+                                # Log size after saving
+                                try:
+                                    size = rar_path_local.stat().st_size
+                                    logger.info(f"Popup download completed: {rar_path_local} ({size} bytes)")
+                                except Exception:
+                                    logger.info(f"Popup download completed: {rar_path_local}")
+                            finally:
+                                try:
+                                    await popup.close()
+                                except Exception:
+                                    pass
+                            # Attempt extraction and register
+                            if res and mp4_filename_local:
+                                logger.info(f"Extracting downloaded rar to generate {mp4_filename_local}")
+                                extract_rar(downloads_dir / folder_name / rar_filename, course_dir)
+                                if (course_dir / mp4_filename_local).exists():
+                                    if mp4_filename_local not in downloaded[folder_name]["mp4s"]:
+                                        downloaded[folder_name]["mp4s"].append(mp4_filename_local)
+                                        save_downloaded(downloaded)
+                    except Exception as e:
+                        logger.warning(f"Failed popup download task for item #{index}: {e}")
+                logger.info(f"Scheduling popup download task for item #{idx} -> {expected_filename or 'unknown'}")
+                tasks.append(popup_download_task())
+                continue
+            # Fallback to parse_li href navigation if there's no offline anchor
             result = await parse_li(li_html, idx)
             if not result:
                 continue
@@ -252,10 +342,23 @@ async def process_course(context: BrowserContext, course_id: str, downloads_dir:
             if mp4_filename in downloaded[folder_name]["mp4s"]:
                 logger.info(f"Already extracted: {mp4_filename}")
                 continue
-            tasks.append(download_and_extract(context, href, filename, downloads_dir, course_dir, downloaded, folder_name, mp4_filename))
+            # wrap download to acquire semaphore
+            async def download_task(href=href, filename=filename, mp4_filename=mp4_filename):
+                await download_sem.acquire()
+                try:
+                    await download_and_extract(context, href, filename, downloads_dir, course_dir, downloaded, folder_name, mp4_filename)
+                finally:
+                    download_sem.release()
+
+            logger.info(f"Scheduling direct download task for item #{idx} -> {filename}")
+            tasks.append(download_task())
 
         # Run downloads concurrently
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Log exceptions from concurrent tasks
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning(f"Background task returned exception: {r}")
 
         logger.info(f"Completed processing course {course_id}.")
 
@@ -268,11 +371,14 @@ async def process_course(context: BrowserContext, course_id: str, downloads_dir:
 async def parse_li(li_html: str, idx: int) -> Optional[tuple[str, str]]:
     """Extract offline link, index, and datetime from li HTML."""
     logger.debug(f"Parsing item #{idx}...")
-    href_m = re.search(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>[^<]*آفلاین', li_html)
+    href_m = re.search(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>.*?آفلاین', li_html, re.S)
     if not href_m:
         logger.warning(f"No offline link in item #{idx}.")
         return None
     href = href_m.group(1)
+    # Make href absolute if relative
+    if href.startswith('/'):
+        href = BASE_URL + href
 
     # find the datetime parentheses containing a Persian month
     all_parens = re.findall(r"\(([^)]+)\)", li_html)
@@ -370,20 +476,77 @@ async def download_and_extract(context: BrowserContext, href: str, filename: str
         return
     
     logger.info(f"Downloading {filename}...")
+    logger.info(f"Starting direct download: {filename} -> {href} (will save to {rar_path})")
     max_retries = 3
     for attempt in range(max_retries):
         dl_page = await context.new_page()
         try:
-            await dl_page.goto(href, timeout=TIMEOUT_PAGE_LOAD)
+            logger.info(f"Opening download page for {filename}: {href}")
+            try:
+                await dl_page.goto(href, timeout=TIMEOUT_PAGE_LOAD)
+            except Exception as e:
+                logger.warning(f"Goto failed for {href}: {e}; attempting click navigation instead")
+                # Try to open via navigation by clicking a link from the parent page if available
+                raise
             page_text = await dl_page.inner_text('body')
             if "فایل آفلاین این جلسه در حال آماده سازی است" in page_text:
                 logger.warning(f"The offline file for {filename} is being prepared. Please run the script again in a few hours.")
                 return
-            async with dl_page.expect_download(timeout=DOWNLOAD_TIMEOUT) as download_info:
-                await dl_page.click("a:has-text('MP4')")
-            download = await download_info.value
-            await download.save_as(rar_path)
-            logger.info(f"Downloaded to: {rar_path}")
+            # Try multiple selector strategies for the actual downloadable file link.
+            # Prefer direct .rar or .mp4 links; otherwise try download labels in English or Persian.
+            # Try to directly trigger the download on this page
+            try:
+                await trigger_download_on_page(dl_page, rar_path, DOWNLOAD_TIMEOUT)
+            except Exception as e:
+                logger.info(f"Direct download on page failed: {e}; trying to follow an offline link or handle popup")
+                # Try to find 'لینک آفلاین' anchor and follow it
+                alt_anchor = await dl_page.query_selector("a:has-text('لینک آفلاین'), a[href^=\"https://offline.sbu.ac.ir\"]")
+                if alt_anchor:
+                    try:
+                        async with dl_page.expect_popup(timeout=5000) as popup_info:
+                            await alt_anchor.click()
+                        popup = await popup_info.value
+                        try:
+                            await trigger_download_on_page(popup, rar_path, DOWNLOAD_TIMEOUT)
+                        finally:
+                            try:
+                                await popup.close()
+                            except Exception:
+                                pass
+                    except Exception as e2:
+                        logger.warning(f"Popup download fallback failed: {e2}")
+                        raise
+                else:
+                    raise
+            else:
+                # If no download candidate, try to trigger a navigation to the actual file (some pages have a link inside a button)
+                # Try to find any anchor with 'آفلاین' text
+                alt_anchor = await dl_page.query_selector("a:has-text('آفلاین'), a:has-text('لینک آفلاین')")
+                if alt_anchor:
+                    # follow it - either it will redirect to file or reveal a download link
+                    href2 = await alt_anchor.get_attribute('href')
+                    if href2 and href2.startswith('http'):
+                        logger.info(f"Following secondary offline link to {href2}")
+                        await dl_page.goto(href2, timeout=TIMEOUT_PAGE_LOAD)
+                        # After navigation, attempt to trigger download on the new page
+                        await trigger_download_on_page(dl_page, rar_path, DOWNLOAD_TIMEOUT)
+                    else:
+                        # Last resort: try a click on 'body' or the first 'a' elements
+                        anchors_any = await dl_page.query_selector_all('a')
+                        if anchors_any:
+                            logger.info("Falling back to click on the first anchor in the page")
+                            async with dl_page.expect_download(timeout=DOWNLOAD_TIMEOUT):
+                                await anchors_any[0].click()
+                        else:
+                            raise Exception('Could not find downloadable link on page')
+                else:
+                    raise Exception('Could not find downloadable link on page')
+            # download saved by trigger_download_on_page or expect_download contexts above
+            try:
+                size = rar_path.stat().st_size
+                logger.info(f"Downloaded (saved) to: {rar_path} ({size} bytes)")
+            except Exception:
+                logger.info(f"Downloaded (saved) to: {rar_path}")
             break  # Success
         except Exception as e:
             logger.warning(f"Download attempt {attempt + 1} failed for {filename}: {e}")
@@ -406,6 +569,51 @@ async def download_and_extract(context: BrowserContext, href: str, filename: str
         if mp4_filename not in downloaded[folder_name]["mp4s"]:
             downloaded[folder_name]["mp4s"].append(mp4_filename)
             save_downloaded(downloaded)
+
+
+async def trigger_download_on_page(page: Page, rar_path: Path, timeout: int) -> None:
+    """Given a Playwright `page` that contains a download button, trigger the download and save it to rar_path.
+    This function tries multiple selectors and popup download flows.
+    """
+    candidate_selectors = [
+        'a.btn[href*="mp4-"]',
+        'a[href*="mp4-"]',
+        'a[href$=".rar"]',
+        'a[href$=".mp4"]',
+        'a.btn:has-text("دانلود")',
+        'a.btn:has-text("MP4")',
+        'a:has-text("دانلود فایل")',
+        'a:has-text("MP4")',
+        'a:has-text("دانلود فایل آفلاین")',
+        'a:has-text("لینک آفلاین")'
+    ]
+    download_selector = None
+    for sel in candidate_selectors:
+        if await page.query_selector(sel):
+            download_selector = sel
+            break
+    if not download_selector:
+        # Debug info: list anchors and sample of body text
+        anchors = await page.query_selector_all('a')
+        anchors_preview = []
+        for a in anchors[:10]:
+            txt = (await a.text_content()) or ''
+            href = (await a.get_attribute('href')) or ''
+            anchors_preview.append({'text': txt.strip(), 'href': href})
+        body_preview = (await page.inner_text('body'))[:200]
+        raise Exception(f'Could not find downloadable link on offline page. body_snippet={body_preview!r}, anchors={anchors_preview!r}')
+    # Use expect_download on same page or handle popup
+    logger.info(f"Triggering download on page using selector '{download_selector}' for target '{rar_path.name}'")
+    async with page.expect_download(timeout=timeout) as download_info:
+        await page.click(download_selector)
+    download = await download_info.value
+    await download.save_as(rar_path)
+    # Report size if possible
+    try:
+        size = rar_path.stat().st_size
+        logger.info(f"Downloaded to: {rar_path} ({size} bytes)")
+    except Exception:
+        logger.info(f"Downloaded to: {rar_path}")
 
 
 def sanitize_filename(name: str) -> str:
@@ -505,7 +713,8 @@ async def main() -> None:
         try:
             await login(page, username, password)
 
-            course_infos = await get_course_ids(page)
+            # Use settings concurrency for course metadata fetching
+            course_infos = await get_course_ids(context, page, max_workers=getattr(settings, 'MAX_CONCURRENT_COURSE_FETCH', 6))
 
             if args.course_id:
                 # Process single course
@@ -532,7 +741,10 @@ async def main() -> None:
         except Exception as e:
             logger.error(f"Error: {e}")
         finally:
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception as e:
+                logger.warning(f"Error while closing browser: {e}")
 
 
 if __name__ == '__main__':
