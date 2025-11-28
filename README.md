@@ -1,5 +1,9 @@
 # SBU LMS Video Downloader
 
+💡 Note: This repository’s docs, examples, and source code were AI-assisted; engineering, testing, and final integration were done by me.
+
+💡 توجه (فارسی): این مخزن — شامل مستندات، نمونه‌ها و کد منبع — با کمک مدل‌های هوش مصنوعی تولید شده است. مهندسی، تست و ادغام نهایی توسط من انجام شده است.
+
 This production-ready Python script logs into Shahid Beheshti University (SBU) LMS (and other **Moodle**-based LMSs), iterates through available courses, finds offline `.rar` lecture packages, downloads them, and extracts organized `.mp4` files. It includes robust logging, retry logic, and a small JSON database to avoid re-processing already-extracted files.
 It also automatically renames and sorts files based on the class session's date and time.
 
